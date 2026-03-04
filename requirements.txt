@@ -1,24 +1,32 @@
-# ============================================================
-# NotebookLM Clone — Requirements
-# ============================================================
-# Install all dependencies with:
-#   pip install -r requirements.txt
-#
-# Prerequisites:
-#   - Ollama must be installed and running (https://ollama.com)
-#   - Pull required models:
-#     ollama pull gemma3:4b
-#     ollama pull nomic-embed-text
-# ============================================================
+# ──────────────────────────────────────────────────────────────
+# NotebookLM — Production Dependencies
+# ──────────────────────────────────────────────────────────────
 
+# Core framework
 streamlit>=1.40.0
+
+# LangChain ecosystem
 langchain>=0.3.0
+langchain-core>=0.3.0
 langchain-community>=0.3.0
 langchain-ollama>=0.3.0
 langchain-text-splitters>=0.3.0
-chromadb>=0.5.0
+
+# Vector store
+chromadb>=0.5.23
+
+# Document processing
 pypdf>=4.0.0
-youtube-transcript-api>=0.6.0
 beautifulsoup4>=4.12.0
-requests>=2.31.0
 lxml>=5.0.0
+
+# YouTube
+youtube-transcript-api>=0.6.0
+yt-dlp>=2024.0.0
+
+# HTTP / Security
+requests>=2.32.0
+certifi>=2024.0.0
+
+# Tokenisation
+tiktoken>=0.7.0
