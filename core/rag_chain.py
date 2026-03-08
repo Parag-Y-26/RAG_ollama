@@ -5,11 +5,14 @@ Retrieval order:
     1. Knowledge base
     2. Live DuckDuckGo web search
     3. Base model fallback
+
+All streaming is fully synchronous — no asyncio, no event loops.
+Safe for Streamlit's Tornado runtime.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -78,16 +81,16 @@ Be concise, factual, and honest about uncertainty.\
 
 @dataclass
 class StreamingResponse:
-    """Container returned by `RAGChain.astream()`."""
+    """Container returned by `RAGChain.stream()`."""
 
     source_documents: list[SearchResult] = field(default_factory=list)
     mode: str = "rag"
     web_results_used: bool = False
-    token_stream: AsyncGenerator[str, None] = field(default=None)  # type: ignore[assignment]
+    token_stream: Iterator[str] = field(default=None)  # type: ignore[assignment]
 
 
 class RAGChain:
-    """Retrieval-augmented generation chain with async streaming."""
+    """Retrieval-augmented generation chain with synchronous streaming."""
 
     def __init__(
         self,
@@ -131,13 +134,16 @@ class RAGChain:
         )
         self._unused_ollama_base_url = ollama_base_url
 
-    async def astream(
+    def stream(
         self,
         query: str,
         top_k: int = 5,
     ) -> StreamingResponse:
         """
-        Three-tier retrieval: KB -> Web Search -> Base LLM.
+        Three-tier synchronous retrieval: KB -> Web Search -> Base LLM.
+
+        Returns a StreamingResponse whose token_stream is a SYNCHRONOUS
+        generator. Safe to pass directly to st.write_stream().
         """
         kb_results = self._kb.similarity_search(query, top_k=top_k)
 
@@ -146,7 +152,7 @@ class RAGChain:
                 source_documents=kb_results,
                 mode="rag",
                 web_results_used=False,
-                token_stream=self._stream_rag(query, kb_results),
+                token_stream=self._stream_rag_sync(query, kb_results),
             )
 
         if self._enable_web_search and self._web_searcher is not None:
@@ -159,7 +165,7 @@ class RAGChain:
                         source_documents=[],
                         mode="web_search",
                         web_results_used=True,
-                        token_stream=self._stream_web_search(query, web_context),
+                        token_stream=self._stream_web_sync(query, web_context),
                     )
             except Exception as exc:
                 logger.warning("Web search fallback failed: %s", exc)
@@ -168,48 +174,48 @@ class RAGChain:
             source_documents=[],
             mode="base",
             web_results_used=False,
-            token_stream=self._stream_base(query),
+            token_stream=self._stream_base_sync(query),
         )
 
-    async def _stream_rag(
-        self,
-        query: str,
-        results: list[SearchResult],
-    ) -> AsyncGenerator[str, None]:
-        """Stream tokens using retrieved KB context via LCEL."""
+    # ------------------------------------------------------------------
+    # Synchronous streaming generators
+    # ------------------------------------------------------------------
+
+    def _stream_rag_sync(
+        self, query: str, results: list[SearchResult]
+    ) -> Iterator[str]:
+        """Synchronous RAG streaming via LangChain .stream()."""
         context = self._format_context(results)
         chain = self._rag_prompt | self._llm
-
         try:
-            async for token in chain.astream({"context": context, "input": query}):
-                yield self._chunk_to_text(token)
+            for chunk in chain.stream({"context": context, "input": query}):
+                yield self._chunk_to_text(chunk)
         except Exception as exc:
-            yield f"\n\nAn error occurred while generating the response: {exc}"
+            yield f"\n\n⚠️ Error: {exc}"
 
-    async def _stream_web_search(
-        self,
-        query: str,
-        web_context: str,
-    ) -> AsyncGenerator[str, None]:
-        """Stream an answer from web search context via LCEL."""
+    def _stream_web_sync(
+        self, query: str, web_context: str
+    ) -> Iterator[str]:
+        """Synchronous web-search-augmented streaming."""
         chain = self._web_search_prompt | self._llm
         try:
-            async for token in chain.astream(
-                {"context": web_context, "input": query}
-            ):
-                yield self._chunk_to_text(token)
+            for chunk in chain.stream({"context": web_context, "input": query}):
+                yield self._chunk_to_text(chunk)
         except Exception as exc:
-            yield f"\n\nError generating response from web results: {exc}"
+            yield f"\n\n⚠️ Error: {exc}"
 
-    async def _stream_base(self, query: str) -> AsyncGenerator[str, None]:
-        """Stream tokens from the base model with no retrieved context."""
+    def _stream_base_sync(self, query: str) -> Iterator[str]:
+        """Synchronous base model streaming (no context)."""
         chain = self._base_prompt | self._llm
-
         try:
-            async for token in chain.astream({"input": query}):
-                yield self._chunk_to_text(token)
+            for chunk in chain.stream({"input": query}):
+                yield self._chunk_to_text(chunk)
         except Exception as exc:
-            yield f"\n\nAn error occurred while generating the response: {exc}"
+            yield f"\n\n⚠️ Error: {exc}"
+
+    # ------------------------------------------------------------------
+    # Helpers (unchanged)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _format_context(results: list[SearchResult]) -> str:

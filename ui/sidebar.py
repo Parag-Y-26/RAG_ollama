@@ -1,10 +1,11 @@
 """
-Sidebar UI for health, model selection, search, research, and ingestion.
+Sidebar UI for health, model selection, API keys, search, research, and ingestion.
 """
 
 from __future__ import annotations
 
 import io
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,20 @@ from core.ingestion import load_pdf, load_plaintext, load_webpage, load_youtube
 from core.models import health_check
 from core.research import PerplexityResearcher
 from core.vectorstore import KnowledgeBase
+
+
+# ---------------------------------------------------------------------------
+# Provider display labels
+# ---------------------------------------------------------------------------
+
+_PROVIDER_LABELS: dict[str, str] = {
+    "ollama": "Ollama (local)",
+    "ollama_cloud": "Ollama Cloud",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "groq": "Groq",
+    "nvidia": "NVIDIA NIM",
+}
 
 
 def _get_kb() -> KnowledgeBase:
@@ -64,6 +79,11 @@ def _extract_yt_id(url: str) -> Optional[str]:
     return None
 
 
+# ===================================================================
+# Sidebar entry point
+# ===================================================================
+
+
 def render_sidebar() -> None:
     """Render the full left sidebar."""
     with st.sidebar:
@@ -72,6 +92,8 @@ def render_sidebar() -> None:
             unsafe_allow_html=True,
         )
         _render_health_indicator()
+        _sidebar_rule()
+        _render_api_keys_section()
         _sidebar_rule()
         _render_model_selector()
         _sidebar_rule()
@@ -89,56 +111,237 @@ def _sidebar_rule() -> None:
     )
 
 
+# ===================================================================
+# Health indicator
+# ===================================================================
+
+
 def _render_health_indicator() -> None:
-    """Show Ollama server status."""
+    """Show Ollama local server status and cloud key status."""
+    # Re-read settings in case runtime key was patched
+    from config.settings import settings as _settings
+
     status = health_check()
+    provider = st.session_state.get("selected_provider", "ollama")
 
     if status.is_running:
         st.markdown(
-            f'<p class="status-online">● ollama · {len(status.models)} models</p>',
+            f'<p class="status-online">● ollama local · {len(status.models)} models</p>',
             unsafe_allow_html=True,
         )
     else:
+        if provider == "ollama":
+            st.markdown(
+                '<p class="status-offline">○ ollama offline</p>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<p class="status-online" style="color:#555555;">○ ollama local offline</p>',
+                unsafe_allow_html=True,
+            )
+
+    # Ollama Cloud status
+    if _settings.ollama_cloud_enabled:
         st.markdown(
-            '<p class="status-offline">○ ollama offline</p>',
+            '<p class="status-online">● ollama cloud · key configured</p>',
             unsafe_allow_html=True,
         )
+
+    # NVIDIA NIM status
+    if _settings.nvidia_enabled:
+        if _settings.nvidia_is_self_hosted:
+            st.markdown(
+                f'<p class="status-online">● nvidia nim · self-hosted</p>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<p class="status-online">● nvidia nim · api catalog</p>',
+                unsafe_allow_html=True,
+            )
 
     st.session_state.ollama_running = status.is_running
 
 
+# ===================================================================
+# API Keys section
+# ===================================================================
+
+
+def _render_api_keys_section() -> None:
+    """
+    Collapsible API keys manager.
+
+    Keys entered here are stored in os.environ for the current process.
+    For persistence across restarts, add them to .streamlit/secrets.toml.
+    """
+    from config.settings import settings as _settings
+
+    with st.expander("API Keys", expanded=False):
+        st.caption("Keys last for this session only.")
+        st.caption("For persistence: add to `.streamlit/secrets.toml`")
+
+        # ── Ollama Cloud ───────────────────────────────────────────
+        st.markdown("**Ollama Cloud**")
+        st.caption("Get your key: [ollama.com/settings/keys](https://ollama.com/settings/keys)")
+        _render_key_input(
+            label="OLLAMA_API_KEY",
+            session_key="_runtime_ollama_cloud_key",
+            env_key="OLLAMA_API_KEY",
+            current_value=_settings.ollama_cloud_api_key,
+            placeholder="ollama_...",
+        )
+
+        st.divider()
+
+        # ── NVIDIA NIM ─────────────────────────────────────────────────
+        st.markdown("**NVIDIA NIM**")
+        st.caption("Free key: [build.nvidia.com](https://build.nvidia.com/explore)")
+        _render_key_input(
+            label="NVIDIA_API_KEY",
+            session_key="_runtime_nvidia_key",
+            env_key="NVIDIA_API_KEY",
+            current_value=_settings.nvidia_api_key,
+            placeholder="nvapi-...",
+        )
+
+        st.divider()
+
+        # ── OpenAI ─────────────────────────────────────────────────
+        st.markdown("**OpenAI**")
+        _render_key_input(
+            label="OPENAI_API_KEY",
+            session_key="_runtime_openai_key",
+            env_key="OPENAI_API_KEY",
+            current_value=_settings.openai_api_key,
+            placeholder="sk-...",
+        )
+
+        # ── Anthropic ──────────────────────────────────────────────
+        st.markdown("**Anthropic**")
+        _render_key_input(
+            label="ANTHROPIC_API_KEY",
+            session_key="_runtime_anthropic_key",
+            env_key="ANTHROPIC_API_KEY",
+            current_value=_settings.anthropic_api_key,
+            placeholder="sk-ant-...",
+        )
+
+        # ── Groq ───────────────────────────────────────────────────
+        st.markdown("**Groq**")
+        _render_key_input(
+            label="GROQ_API_KEY",
+            session_key="_runtime_groq_key",
+            env_key="GROQ_API_KEY",
+            current_value=_settings.groq_api_key,
+            placeholder="gsk_...",
+        )
+
+        # ── Perplexity ─────────────────────────────────────────────
+        st.markdown("**Perplexity** (web research)")
+        _render_key_input(
+            label="PPLX_API_KEY",
+            session_key="_runtime_pplx_key",
+            env_key="PPLX_API_KEY",
+            current_value=_settings.perplexity_api_key,
+            placeholder="pplx-...",
+        )
+
+
+def _render_key_input(
+    label: str,
+    session_key: str,
+    env_key: str,
+    current_value: str,
+    placeholder: str,
+) -> None:
+    """Reusable key input widget for a single provider."""
+    display_value = st.session_state.get(session_key, "") or current_value
+    new_val = st.text_input(
+        label,
+        value=display_value,
+        type="password",
+        key=f"key_input_{env_key}",
+        placeholder=placeholder,
+        label_visibility="visible",
+    )
+    if new_val and new_val != display_value:
+        _patch_runtime_key(env_key, new_val)
+        st.session_state[session_key] = new_val
+        # Clear cached LLM so it picks up the new key
+        from core.llm import get_llm
+
+        get_llm.cache_clear()
+        st.rerun()
+
+
+def _patch_runtime_key(env_key: str, value: str) -> None:
+    """
+    Inject a key into the live environment so config.settings can read it.
+
+    os.environ is process-wide so the change persists for the duration
+    of the Streamlit process. We also rebuild the Settings singleton
+    so cached properties pick up the new values.
+    """
+    os.environ[env_key] = value
+
+    # Reconstruct the module-level settings singleton
+    from config import settings as settings_module
+
+    settings_module.settings = settings_module.Settings()
+
+
+# ===================================================================
+# Model selector
+# ===================================================================
+
+
 def _render_model_selector() -> None:
     """Provider picker, model picker, and auto web-search toggle."""
-    from core.llm import get_available_cloud_models
+    from core.llm import get_available_cloud_models, get_ollama_cloud_models_live
     from core.models import get_available_models as get_ollama_models
+
+    # Re-read settings in case runtime key was patched
+    from config.settings import settings as _settings
 
     st.markdown("### Model")
 
-    available_providers: list[str] = ["ollama"]
-    if settings.openai_enabled:
-        available_providers.append("openai")
-    if settings.anthropic_enabled:
-        available_providers.append("anthropic")
-    if settings.groq_enabled:
-        available_providers.append("groq")
+    # All providers are always visible — users enter keys via the
+    # API Keys expander above. This avoids chicken-and-egg problem.
+    available_providers: list[str] = [
+        "ollama",
+        "ollama_cloud",
+        "openai",
+        "anthropic",
+        "groq",
+        "nvidia",
+    ]
+
+    # Provider display labels
+    provider_labels = [_PROVIDER_LABELS.get(p, p) for p in available_providers]
 
     current_provider = st.session_state.get(
         "selected_provider",
-        settings.llm_provider or "ollama",
+        _settings.llm_provider or "ollama",
     )
-    provider = st.selectbox(
+    try:
+        current_idx = available_providers.index(current_provider)
+    except ValueError:
+        current_idx = 0
+
+    selected_label = st.selectbox(
         "Provider",
-        available_providers,
-        index=(
-            available_providers.index(current_provider)
-            if current_provider in available_providers
-            else 0
-        ),
+        provider_labels,
+        index=current_idx,
         key="provider_selectbox",
         label_visibility="visible",
     )
+    # Map label back to internal provider ID
+    provider = available_providers[provider_labels.index(selected_label)]
     st.session_state.selected_provider = provider
 
+    # ── Model selection per provider ──────────────────────────────
     if provider == "ollama":
         if not st.session_state.get("ollama_running", False):
             st.caption("Start Ollama to select a model.")
@@ -151,29 +354,58 @@ def _render_model_selector() -> None:
                     st.rerun()
             with col_sel:
                 _pick_model(models, provider)
+
+    elif provider == "ollama_cloud":
+        models = get_ollama_cloud_models_live()
+        if not models:
+            st.caption("No cloud models found.")
+        else:
+            col_sel, col_ref = st.columns([4, 1])
+            with col_ref:
+                if st.button("↺", key="refresh_cloud_models", help="Refresh cloud models"):
+                    st.rerun()
+            with col_sel:
+                _pick_model(models, provider)
+        st.caption("✓ Ollama Cloud key configured")
+        st.caption("Models run on ollama.com infrastructure")
+
+    elif provider == "nvidia":
+        _render_nvidia_model_selector()
+
     else:
+        # OpenAI, Anthropic, Groq — live fetch when key is available,
+        # static fallback otherwise (models always shown)
         models = get_available_cloud_models(provider)
         if not models:
             st.caption(f"No models configured for {provider}.")
         else:
-            _pick_model(models, provider)
+            # Refresh button for providers with live fetch
+            if provider in ("openai", "groq"):
+                col_sel, col_ref = st.columns([4, 1])
+                with col_ref:
+                    if st.button("↺", key=f"refresh_{provider}_models", help="Refresh models"):
+                        st.rerun()
+                with col_sel:
+                    _pick_model(models, provider)
+            else:
+                _pick_model(models, provider)
 
         key_map = {
-            "openai": settings.openai_enabled,
-            "anthropic": settings.anthropic_enabled,
-            "groq": settings.groq_enabled,
+            "openai": _settings.openai_enabled,
+            "anthropic": _settings.anthropic_enabled,
+            "groq": _settings.groq_enabled,
         }
         if key_map.get(provider):
-            st.caption("✓ API key configured")
+            st.caption("✓ API key configured · live models")
         else:
-            st.caption(f"✗ Add {provider.upper()}_API_KEY to secrets.toml")
+            st.caption(f"✗ Add {provider.upper()}_API_KEY in ▸ API Keys above")
 
     st.markdown("---")
     web_search_enabled = st.toggle(
-        "Auto web search",
+        "AUTO WEB SEARCH",
         value=st.session_state.get(
             "enable_web_search",
-            settings.web_search_enabled_by_default,
+            _settings.web_search_enabled_by_default,
         ),
         key="web_search_toggle",
         help=(
@@ -185,7 +417,10 @@ def _render_model_selector() -> None:
     st.session_state.enable_web_search = web_search_enabled
 
     if web_search_enabled:
-        st.caption("● web search active")
+        st.markdown(
+            '<p class="status-online">○ web search active</p>',
+            unsafe_allow_html=True,
+        )
     else:
         st.caption("○ web search off")
 
@@ -201,14 +436,91 @@ def _pick_model(models: list[str], provider: str) -> None:
         key=f"model_selectbox_{provider}",
         label_visibility="visible",
     )
+    # If model changed, invalidate the cached RAG chain
+    if selected != st.session_state.get("selected_model"):
+        from ui.chat import _get_rag_chain
+
+        _get_rag_chain.clear()
     st.session_state.selected_model = selected
+
+
+def _render_nvidia_model_selector() -> None:
+    """
+    NVIDIA NIM model selector with live discovery and mode indicator.
+    Shows whether using hosted API Catalog or self-hosted local NIM.
+    """
+    from core.llm import get_available_nvidia_models
+    from config.settings import settings as _settings
+
+    # Mode indicator
+    if _settings.nvidia_is_self_hosted:
+        st.caption(f"○ self-hosted NIM · {_settings.nvidia_nim_base_url}")
+    elif _settings.nvidia_api_key:
+        key_hint = _settings.nvidia_api_key[:10] + "…"
+        st.caption(f"● API Catalog · {key_hint}")
+    else:
+        st.caption("✗ Add NVIDIA_API_KEY or NVIDIA_NIM_BASE_URL to secrets.toml")
+        return
+
+    # Model selector with live refresh
+    col_sel, col_ref = st.columns([4, 1])
+
+    with col_ref:
+        if st.button("↺", key="refresh_nvidia_models", help="Fetch live model list"):
+            st.session_state.pop("nvidia_models_cache", None)
+            st.rerun()
+
+    # Fetch models — use session state as lightweight cache
+    if "nvidia_models_cache" not in st.session_state:
+        with st.spinner("Fetching NVIDIA models…"):
+            st.session_state.nvidia_models_cache = get_available_nvidia_models()
+
+    models = st.session_state.nvidia_models_cache
+
+    with col_sel:
+        current = st.session_state.get("selected_model", models[0] if models else "")
+        idx = models.index(current) if current in models else 0
+        selected = st.selectbox(
+            "Model",
+            models,
+            index=idx,
+            key="model_selectbox_nvidia",
+            label_visibility="visible",
+        )
+        if selected != st.session_state.get("selected_model"):
+            from ui.chat import _get_rag_chain
+
+            _get_rag_chain.clear()
+        st.session_state.selected_model = selected
+
+    # Context window hint for selected model
+    _CONTEXT_HINTS = {
+        "meta/llama-3.3-70b-instruct": "128K ctx · flagship",
+        "meta/llama-3.1-8b-instruct": "128K ctx · fast",
+        "nvidia/llama-3.1-nemotron-70b-instruct": "32K ctx · NVIDIA optimized",
+        "nvidia/nemotron-mini-4b-instruct": "4K ctx · lightweight",
+        "deepseek-ai/deepseek-r1": "64K ctx · reasoning",
+        "mistralai/mixtral-8x22b-instruct-v0.1": "65K ctx",
+        "microsoft/phi-3-medium-128k-instruct": "128K ctx · efficient",
+        "google/gemma-2-27b-it": "8K ctx",
+    }
+    hint = _CONTEXT_HINTS.get(selected, "")
+    if hint:
+        st.caption(hint)
+
+
+# ===================================================================
+# Research section
+# ===================================================================
 
 
 def _render_research_section() -> None:
     """Perplexity research input."""
+    from config.settings import settings as _settings
+
     st.markdown("### Web Research")
 
-    api_key = settings.perplexity_api_key
+    api_key = _settings.perplexity_api_key
     if not api_key:
         st.caption("Add `PPLX_API_KEY` to `.streamlit/secrets.toml` to enable.")
         return
@@ -240,6 +552,11 @@ def _render_research_section() -> None:
                 st.warning(str(exc))
             except Exception as exc:
                 st.error(f"Research failed: {exc}")
+
+
+# ===================================================================
+# Ingestion tabs
+# ===================================================================
 
 
 def _render_ingestion_tabs() -> None:

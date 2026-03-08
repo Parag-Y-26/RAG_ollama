@@ -1,12 +1,12 @@
 """
 Streaming chat interface with source citations and inline web search.
+
+All streaming is fully synchronous — no asyncio bridges needed.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
-from collections.abc import Generator
 from pathlib import Path
 
 import streamlit as st
@@ -76,39 +76,6 @@ def _init_messages() -> None:
         ]
 
 
-def _sync_stream(async_gen) -> Generator[str, None, None]:
-    """
-    Consume an async generator synchronously, token by token.
-    Uses a single event loop for the full stream duration.
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        while True:
-            try:
-                yield loop.run_until_complete(async_gen.__anext__())
-            except StopAsyncIteration:
-                break
-    finally:
-        loop.close()
-
-
-def _run_rag(
-    chain: RAGChain,
-    prompt: str,
-) -> tuple[StreamingResponse, Generator[str, None, None]]:
-    """
-    Run chain.astream() and return response metadata plus a sync token stream.
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        resp: StreamingResponse = loop.run_until_complete(
-            chain.astream(prompt, top_k=5)
-        )
-    finally:
-        loop.close()
-    return resp, _sync_stream(resp.token_stream)
-
-
 def render_chat() -> None:
     """Render the complete chat interface."""
     _init_messages()
@@ -135,6 +102,11 @@ def _handle_user_input(prompt: str) -> None:
     if not prompt:
         return
 
+    # --- Duplicate message guard (prevents double-send on Streamlit rerun) ---
+    last_msg = st.session_state.messages[-1] if st.session_state.messages else {}
+    if last_msg.get("role") == "user" and last_msg.get("content") == prompt:
+        return
+
     lowered = prompt.lower()
     if lowered == "/search" or lowered.startswith("/search "):
         query = prompt[7:].strip()
@@ -156,15 +128,19 @@ def _handle_user_input(prompt: str) -> None:
         settings.web_search_enabled_by_default,
     )
 
-    store.save_message(notebook_id, "user", prompt)
+    # 1 — Append to session state + persist user message
     st.session_state.messages.append(
         {"role": "user", "content": prompt, "sources": [], "mode": ""}
     )
+    store.save_message(notebook_id, "user", prompt)
+
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # 2 — Stream assistant response
     with st.chat_message("assistant"):
-        if not st.session_state.get("ollama_running", False):
+        # Only block if local Ollama is needed and not running
+        if provider == "ollama" and not st.session_state.get("ollama_running", False):
             err = "Ollama is not running. Start Ollama and refresh the page."
             st.error(err)
             st.session_state.messages.append(
@@ -184,12 +160,16 @@ def _handle_user_input(prompt: str) -> None:
                 provider,
                 enable_web_search,
             )
-            resp, token_gen = _run_rag(chain, prompt)
-            answer: str = st.write_stream(token_gen)
+            # Fully synchronous — no event loops needed
+            resp = chain.stream(prompt, top_k=5)
+            answer: str = st.write_stream(resp.token_stream)
 
-            source_names: list[str] = [source.source for source in resp.source_documents]
+            source_names: list[str] = [
+                source.source for source in resp.source_documents
+            ]
             _render_source_cards(resp.source_documents, resp.mode)
 
+            # 3 — Persist assistant message
             store.save_message(
                 notebook_id,
                 "assistant",
@@ -229,25 +209,28 @@ def _handle_inline_search(query: str) -> None:
     notebook_id = st.session_state.get("notebook_id", "default")
     store = _get_chat_store()
 
-    store.save_message(notebook_id, "user", f"/search {query}")
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": f"/search {query}",
-            "sources": [],
-            "mode": "",
-        }
-    )
+    # Dedup guard for /search messages
+    last = st.session_state.messages[-1] if st.session_state.messages else {}
+    if not (last.get("role") == "user" and last.get("content") == f"/search {query}"):
+        store.save_message(notebook_id, "user", f"/search {query}")
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": f"/search {query}",
+                "sources": [],
+                "mode": "",
+            }
+        )
+
     with st.chat_message("user"):
         st.markdown(f"`/search` {query}")
 
     with st.chat_message("assistant"):
-        with st.spinner(f"Searching for '{query}'..."):
+        with st.spinner(f"Searching…"):
             try:
                 searcher = WebSearcher(
                     max_results=settings.web_search_max_results,
                     max_fetch=0,
-                    region=settings.web_search_region,
                 )
                 results = searcher.search(query)
 
@@ -267,10 +250,10 @@ def _handle_inline_search(query: str) -> None:
 
                 if st.button(
                     f"Absorb all {len(results)} results into KB",
-                    key=f"absorb_inline_{abs(hash(query))}",
+                    key=f"absorb_inline_{abs(hash(query)) % 100000}",
                 ):
                     kb = _get_kb()
-                    with st.spinner("Absorbing..."):
+                    with st.spinner("Absorbing…"):
                         try:
                             docs = searcher.search_and_load(
                                 query,
@@ -298,7 +281,15 @@ def _handle_inline_search(query: str) -> None:
                     }
                 )
             except RuntimeError as exc:
-                st.error(str(exc))
+                # User-friendly rate limit message
+                msg = str(exc)
+                if "rate limit" in msg.lower() or "attempt" in msg.lower():
+                    st.warning(
+                        "DuckDuckGo is temporarily rate limiting requests. "
+                        "Wait 30 seconds and try again, or use the Sidebar → Search tab."
+                    )
+                else:
+                    st.error(msg)
             except Exception as exc:
                 st.error(f"Search failed: {exc}")
 
@@ -308,11 +299,14 @@ def _render_message_actions(msg: dict, idx: int) -> None:
     col_mode, col_copy = st.columns([5, 1])
 
     with col_mode:
-        if msg.get("mode") == "rag" and msg.get("sources"):
+        content = msg.get("content", "")
+        mode = msg.get("mode", "")
+
+        if mode == "rag" and msg.get("sources"):
             st.caption("↳ answered from knowledge base")
-        elif msg.get("mode") == "web_search":
+        elif mode == "web_search" and not content.startswith("⚠️"):
             st.caption("↳ answered from live web search")
-        elif msg.get("mode") == "base":
+        elif mode == "base":
             st.caption("↳ answered from model knowledge")
 
     with col_copy:

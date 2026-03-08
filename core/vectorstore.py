@@ -62,6 +62,9 @@ class _OllamaEmbeddingAdapter:
 
     ChromaDB expects ``__call__(input: list[str]) -> list[list[float]]``
     and ``name() -> str`` (as a method, not a property).
+
+    ChromaDB >=0.5 also calls ``embed_query()`` and ``embed_documents()``
+    directly during ``.query()`` operations.
     """
 
     def __init__(self, model: str, base_url: str) -> None:
@@ -88,6 +91,28 @@ class _OllamaEmbeddingAdapter:
             List of embedding vectors (each a list of floats).
         """
         return self._model.embed_documents(input)
+
+    def embed_documents(self, documents: list[str]) -> list[list[float]]:
+        """Embed a list of documents (required by ChromaDB >=0.5).
+
+        Args:
+            documents: List of text strings to embed.
+
+        Returns:
+            List of embedding vectors.
+        """
+        return self._model.embed_documents(documents)
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a single query string (required by ChromaDB >=0.5).
+
+        Args:
+            query: The search query to embed.
+
+        Returns:
+            A single embedding vector.
+        """
+        return self._model.embed_query(query)
 
 
 # ---------------------------------------------------------------------------

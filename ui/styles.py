@@ -224,25 +224,62 @@ div[data-testid="stButton"] > button[use_container_width="true"] {
     }
 }
 
+/* === AVATAR SELECTORS FOR STREAMLIT ≥1.40 === */
+
 /* User avatar */
+div[data-testid="stChatMessageAvatarUser"],
+[data-testid="stChatMessageAvatarUser"] > div,
 [data-testid="chatAvatarIcon-user"] {
     background-color: #000000 !important;
-    border: 1px solid #1C1C1C !important;
-    color: #FFFFFF !important;
+    background: #000000 !important;
+    border: 1px solid #2E2E2E !important;
     border-radius: 2px !important;
+    color: #FFFFFF !important;
     font-size: 11px !important;
 }
 
 /* Assistant avatar */
+div[data-testid="stChatMessageAvatarAssistant"],
+[data-testid="stChatMessageAvatarAssistant"] > div,
 [data-testid="chatAvatarIcon-assistant"] {
     background-color: #111111 !important;
+    background: #111111 !important;
     border: 1px solid #2E2E2E !important;
-    color: #FFFFFF !important;
     border-radius: 2px !important;
+    color: #FFFFFF !important;
     font-size: 11px !important;
 }
 
-/* --- Chat input ----------------------------------------------- */
+/* Nuke any Streamlit SVG fills on avatars */
+[data-testid="stChatMessageAvatarUser"] svg,
+[data-testid="stChatMessageAvatarAssistant"] svg {
+    fill: #FFFFFF !important;
+    color: #FFFFFF !important;
+}
+
+/* --- Chat input (correct Streamlit ≥1.40 selectors) ---------- */
+div[data-testid="stChatInput"] {
+    background-color: #000000 !important;
+}
+div[data-testid="stChatInput"] > div {
+    border-radius: 2px !important;
+    border: 1px solid #1C1C1C !important;
+    background-color: #0A0A0A !important;
+    transition: border-color 0.15s ease !important;
+}
+div[data-testid="stChatInput"] > div:focus-within {
+    border-color: #FFFFFF !important;
+    box-shadow: none !important;
+}
+div[data-testid="stChatInput"] textarea {
+    font-family: 'DM Mono', monospace !important;
+    font-size: 13px !important;
+    font-weight: 300 !important;
+    color: #FFFFFF !important;
+    caret-color: #FFFFFF !important;
+}
+
+/* Legacy selectors (keep for older Streamlit) */
 .stChatInputContainer {
     background-color: #000000 !important;
     border-top: 1px solid #1C1C1C !important;
@@ -365,8 +402,22 @@ div[data-testid="stButton"] > button[use_container_width="true"] {
 }
 [data-testid="stAlert"][kind="error"] {
     background-color: #0A0A0A !important;
-    border-left-color: #FF4444 !important;
+    border: 1px solid #1C1C1C !important;
+    border-left: 2px solid #FF4444 !important;
+    border-radius: 2px !important;
     color: #FF4444 !important;
+}
+[data-testid="stAlert"][kind="error"] p {
+    color: #FF4444 !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+}
+/* Also target baseweb notification for error alerts */
+div[data-testid="stAlert"][data-baseweb="notification"] {
+    background-color: #0A0A0A !important;
+    border: 1px solid #1C1C1C !important;
+    border-left: 2px solid #FF4444 !important;
+    border-radius: 2px !important;
 }
 
 /* --- Divider -------------------------------------------------- */

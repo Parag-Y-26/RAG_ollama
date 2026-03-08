@@ -64,6 +64,22 @@ class Settings:
         default_factory=lambda: _env("GROQ_API_KEY", "")
     )
 
+    # -- Ollama Cloud --------------------------------------------------------
+    ollama_cloud_api_key: str = field(
+        default_factory=lambda: _env("OLLAMA_API_KEY", "")
+    )
+    ollama_cloud_base_url: str = "https://ollama.com/v1"
+
+    # -- NVIDIA NIM ----------------------------------------------------------
+    nvidia_api_key: str = field(
+        default_factory=lambda: _env("NVIDIA_API_KEY", "")
+    )
+    # For self-hosted NIM deployments on local NVIDIA GPUs.
+    # Leave empty to use the hosted NVIDIA API Catalog.
+    nvidia_nim_base_url: str = field(
+        default_factory=lambda: _env("NVIDIA_NIM_BASE_URL", "")
+    )
+
     # -- Provider selection --------------------------------------------------
     llm_provider: str = field(
         default_factory=lambda: _env("LLM_PROVIDER", "ollama")
@@ -118,6 +134,25 @@ class Settings:
     @property
     def groq_enabled(self) -> bool:
         return bool(self.groq_api_key)
+
+    @property
+    def ollama_cloud_enabled(self) -> bool:
+        """True if an Ollama Cloud API key is configured."""
+        return bool(self.ollama_cloud_api_key)
+
+    @property
+    def nvidia_enabled(self) -> bool:
+        """
+        NVIDIA NIM is enabled if:
+        - An API key is present (hosted API Catalog), OR
+        - A local base_url is configured (self-hosted NIM, no key needed)
+        """
+        return bool(self.nvidia_api_key) or bool(self.nvidia_nim_base_url)
+
+    @property
+    def nvidia_is_self_hosted(self) -> bool:
+        """True when using a local NIM container instead of the hosted catalog."""
+        return bool(self.nvidia_nim_base_url)
 
 
 settings = Settings()

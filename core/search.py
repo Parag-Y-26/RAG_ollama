@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import hashlib
 import time
-import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -116,11 +115,16 @@ class WebSearcher:
 
     def search(self, query: str) -> list[SearchResult]:
         """
-        Run a DuckDuckGo text search and return structured results.
+        Run a DuckDuckGo text search with retry logic and region fallback.
+
+        Retry strategy:
+            - Attempt 1: us-en region, backend="auto", no delay
+            - Attempt 2: wt-wt region, backend="auto", 1.5s delay
+            - Attempt 3: us-en region, backend="html", 3.0s delay
 
         Raises:
             ValueError: If query is blank.
-            RuntimeError: If DDG is unreachable or returns no results.
+            RuntimeError: If DDG is unreachable or returns no results after retries.
         """
         query = query.strip()
         if not query:
@@ -128,88 +132,72 @@ class WebSearcher:
 
         logger.info("DDG search: %r (max_results=%d)", query, self._max_results)
 
-        attempts = [
-            (self._region, self._safesearch, "lite"),
-            (self._region, "off", "lite"),
-            ("us-en", self._safesearch, "lite"),
-            ("us-en", "off", "lite"),
-            (self._region, self._safesearch, "html"),
-            (self._region, "off", "html"),
-            ("us-en", self._safesearch, "html"),
-            ("us-en", "off", "html"),
-            (None, self._safesearch, "html"),
-            (None, "on", "html"),
-            (None, self._safesearch, "auto"),
-        ]
-        seen_attempts: set[tuple[str | None, str, str]] = set()
-        raw: list[dict[str, str]] = []
-        last_error: Exception | None = None
+        from duckduckgo_search import DDGS
 
         try:
-            from duckduckgo_search import DDGS
+            from duckduckgo_search.exceptions import RatelimitException
+        except ImportError:
+            RatelimitException = Exception  # fallback for older versions
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                for region, safesearch, backend in attempts:
-                    attempt = (region, safesearch, backend)
-                    if attempt in seen_attempts:
-                        continue
-                    seen_attempts.add(attempt)
-
-                    try:
-                        with DDGS() as ddgs:
-                            search_kwargs = {
-                                "safesearch": safesearch,
-                                "backend": backend,
-                                "max_results": self._max_results,
-                            }
-                            if region is not None:
-                                search_kwargs["region"] = region
-                            raw = list(
-                                ddgs.text(query, **search_kwargs)
-                            )
-                    except Exception as exc:
-                        last_error = exc
-                        continue
-
-                    if raw:
-                        if attempt != (self._region, self._safesearch, "lite"):
-                            logger.info(
-                                "DDG search fallback succeeded for %r using "
-                                "region=%s safesearch=%s backend=%s",
-                                query,
-                                region,
-                                safesearch,
-                                backend,
-                            )
-                        break
-        except Exception as exc:
-            last_error = exc
-
-        if last_error is not None and not raw:
-            raise RuntimeError(
-                f"DuckDuckGo search failed for query '{query}': {last_error}"
-            ) from last_error
-
-        if not raw:
-            raise RuntimeError(
-                f"DuckDuckGo returned no results for: '{query}'. "
-                "Try rephrasing the query."
-            )
-
-        results = [
-            SearchResult(
-                title=item.get("title", ""),
-                url=item.get("href", ""),
-                snippet=item.get("body", ""),
-                published=item.get("published", "") or item.get("date", ""),
-            )
-            for item in raw
-            if item.get("href")
+        attempts = [
+            {"region": "us-en", "backend": "auto",  "delay": 0},
+            {"region": "wt-wt", "backend": "auto",  "delay": 1.5},
+            {"region": "us-en", "backend": "html",  "delay": 3.0},
         ]
 
-        logger.info("DDG returned %d results", len(results))
-        return results
+        last_exc: Exception | None = None
+        for attempt_cfg in attempts:
+            if attempt_cfg["delay"] > 0:
+                time.sleep(attempt_cfg["delay"])
+            try:
+                raw = DDGS().text(
+                    keywords=query,
+                    region=attempt_cfg["region"],
+                    safesearch=self._safesearch,
+                    max_results=self._max_results,
+                    backend=attempt_cfg["backend"],
+                )
+                if raw:
+                    results = [
+                        SearchResult(
+                            title=item.get("title", ""),
+                            url=item.get("href", ""),
+                            snippet=item.get("body", ""),
+                            published=item.get("published", "") or item.get("date", ""),
+                        )
+                        for item in raw
+                        if item.get("href")
+                    ]
+                    if results:
+                        logger.info(
+                            "DDG returned %d results (region=%s, backend=%s)",
+                            len(results),
+                            attempt_cfg["region"],
+                            attempt_cfg["backend"],
+                        )
+                        return results
+
+            except RatelimitException as e:
+                last_exc = e
+                logger.warning(
+                    "DDG rate limited (region=%s, backend=%s): %s",
+                    attempt_cfg["region"], attempt_cfg["backend"], e,
+                )
+                continue
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "DDG search error (region=%s, backend=%s): %s",
+                    attempt_cfg["region"], attempt_cfg["backend"], e,
+                )
+                continue
+
+        raise RuntimeError(
+            f"DuckDuckGo search failed for '{query}' after 3 attempts. "
+            f"This is usually a temporary rate limit. "
+            f"Please wait 30 seconds and try again. "
+            f"Last error: {last_exc}"
+        )
 
     def search_and_load(
         self,
