@@ -1,52 +1,38 @@
 """
 Streaming RAG chain built with LangChain Expression Language (LCEL).
 
-Provides the ``RAGChain`` class — the intelligence backbone of the app.
-Key design decisions:
-
-* **LCEL only** — no legacy ``create_retrieval_chain`` or
-  ``create_stuff_documents_chain``.  Chains are composed with the ``|``
-  pipe operator.
-* **Async streaming** via ``astream()`` — returns a ``StreamingResponse``
-  containing an ``AsyncGenerator[str, None]`` of tokens **and** the
-  source documents used for attribution.
-* **Confidence gating** — if the retriever finds zero relevant chunks
-  the RAG path is skipped entirely and the base model is used with an
-  explicit disclaimer.
-* **Prompt engineering** — the LLM is instructed to answer *only* from
-  context, cite sources inline, and refuse to hallucinate.
+Retrieval order:
+    1. Knowledge base
+    2. Live DuckDuckGo web search
+    3. Base model fallback
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Optional
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import OllamaLLM
 
+from core.llm import get_llm
 from core.vectorstore import KnowledgeBase, SearchResult
+from utils.logging import get_logger
 
-
-# ---------------------------------------------------------------------------
-# Prompt templates
-# ---------------------------------------------------------------------------
+logger = get_logger(__name__)
 
 _RAG_SYSTEM_PROMPT: str = """\
-You are a precise, citation-aware research assistant.  The user has \
+You are a precise, citation-aware research assistant. The user has \
 built a personal knowledge base and is asking questions about it.
 
-## Rules — follow these WITHOUT exception
+## Rules - follow these without exception
 
-1. Answer **only** from the context provided below.  If the context \
+1. Answer only from the context provided below. If the context \
 does not contain enough information to answer fully, say exactly: \
-"I couldn't find that in your knowledge base." and stop.  \
-**Never fabricate or hallucinate information.**
+"I couldn't find that in your knowledge base." and stop. \
+Never fabricate or hallucinate information.
 2. For every factual claim, cite the source inline using the format \
 [Source N] where N corresponds to the numbered sources below.
-3. Be concise but thorough.  Use bullet points or numbered lists \
+3. Be concise but thorough. Use bullet points or numbered lists \
 when appropriate.
 4. If multiple sources corroborate a fact, cite all of them, e.g. \
 [Source 1][Source 3].
@@ -58,79 +44,82 @@ and explicitly note what is missing.
 {context}
 """
 
+_WEB_SEARCH_SYSTEM_PROMPT: str = """\
+You are a precise research assistant. The user's personal knowledge base had no
+relevant information, so you have been given live web search results to answer
+their question.
+
+## Rules
+
+1. Answer using ONLY the web search results provided below.
+2. Cite every factual claim with [Result N] where N matches the numbered results.
+3. If the results are insufficient, say so clearly. Do not fabricate.
+4. Always note the recency of information where available.
+5. Be concise and structured - use bullet points where appropriate.
+
+## Web Search Results
+
+{context}
+"""
+
 _BASE_SYSTEM_PROMPT: str = """\
-You are a helpful AI assistant.  The user's knowledge base did not \
+You are a helpful AI assistant. The user's knowledge base did not \
 contain any information relevant to this question, so you are \
 answering from your general training data.
 
-⚠️ **Disclaimer**: This response is NOT sourced from your uploaded \
-documents.  It comes from the model's general knowledge and may not \
-be perfectly accurate.  For verified answers, add relevant sources to \
-your knowledge base first.
+Disclaimer: This response is not sourced from uploaded documents. \
+It comes from the model's general knowledge and may not be perfectly \
+accurate. For verified answers, add relevant sources to the knowledge \
+base first.
 
 Be concise, factual, and honest about uncertainty.\
 """
 
 
-# ---------------------------------------------------------------------------
-# Streaming response container
-# ---------------------------------------------------------------------------
-
 @dataclass
 class StreamingResponse:
-    """Container returned by ``RAGChain.astream()``.
-
-    Attributes:
-        source_documents: The ``SearchResult`` objects retrieved from
-            the knowledge base (empty in ``base`` mode).
-        mode: ``"rag"`` if answering from context, ``"base"`` if the
-            knowledge base had no relevant documents.
-        token_stream: An async generator that yields string tokens as
-            they are produced by the LLM.
-    """
+    """Container returned by `RAGChain.astream()`."""
 
     source_documents: list[SearchResult] = field(default_factory=list)
     mode: str = "rag"
+    web_results_used: bool = False
     token_stream: AsyncGenerator[str, None] = field(default=None)  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# RAGChain
-# ---------------------------------------------------------------------------
-
 class RAGChain:
-    """LCEL-based retrieval-augmented generation chain with streaming.
-
-    Typical usage::
-
-        chain = RAGChain(kb, model="deepseek-r1:latest",
-                         ollama_base_url="http://localhost:11434")
-        resp = await chain.astream("What is X?")
-        # resp.source_documents is available immediately
-        async for token in resp.token_stream:
-            print(token, end="", flush=True)
-    """
+    """Retrieval-augmented generation chain with async streaming."""
 
     def __init__(
         self,
         knowledge_base: KnowledgeBase,
         model: str,
-        ollama_base_url: str,
+        provider: str = "ollama",
+        ollama_base_url: str | None = None,
+        enable_web_search: bool = False,
+        web_search_max_results: int = 3,
     ) -> None:
-        """Initialise the RAG chain.
-
-        Args:
-            knowledge_base: The ``KnowledgeBase`` instance to retrieve from.
-            model: Ollama model name for generation.
-            ollama_base_url: Ollama server URL.
-        """
         self._kb = knowledge_base
-        self._llm = OllamaLLM(model=model, base_url=ollama_base_url)
+        self._llm = get_llm(model=model, provider=provider)
+        self._enable_web_search = enable_web_search
 
-        # --- LCEL prompts (never changes after init) ---------------------
+        self._web_searcher = None
+        if enable_web_search:
+            from core.search import WebSearcher
+
+            self._web_searcher = WebSearcher(
+                max_results=web_search_max_results,
+                max_fetch=0,
+            )
+
         self._rag_prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", _RAG_SYSTEM_PROMPT),
+                ("human", "{input}"),
+            ]
+        )
+        self._web_search_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", _WEB_SEARCH_SYSTEM_PROMPT),
                 ("human", "{input}"),
             ]
         )
@@ -140,124 +129,116 @@ class RAGChain:
                 ("human", "{input}"),
             ]
         )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._unused_ollama_base_url = ollama_base_url
 
     async def astream(
         self,
         query: str,
         top_k: int = 5,
     ) -> StreamingResponse:
-        """Run a streaming RAG query.
-
-        1. Retrieves top-k similar chunks from the knowledge base.
-        2. If no chunks are found (**confidence gating**), falls back to
-           the base model with a disclaimer.
-        3. Returns a ``StreamingResponse`` whose ``token_stream`` is an
-           async generator of string tokens.
-
-        Args:
-            query: The user's natural-language question.
-            top_k: Number of chunks to retrieve.
-
-        Returns:
-            A ``StreamingResponse`` with source documents and a token
-            stream ready for consumption.
         """
-        # --- Retrieval (synchronous — chromadb is not async) -------------
-        results: list[SearchResult] = self._kb.similarity_search(
-            query, top_k=top_k
-        )
+        Three-tier retrieval: KB -> Web Search -> Base LLM.
+        """
+        kb_results = self._kb.similarity_search(query, top_k=top_k)
 
-        if not results:
-            # Confidence gating — no relevant documents
+        if kb_results:
             return StreamingResponse(
-                source_documents=[],
-                mode="base",
-                token_stream=self._stream_base(query),
+                source_documents=kb_results,
+                mode="rag",
+                web_results_used=False,
+                token_stream=self._stream_rag(query, kb_results),
             )
 
-        return StreamingResponse(
-            source_documents=results,
-            mode="rag",
-            token_stream=self._stream_rag(query, results),
-        )
+        if self._enable_web_search and self._web_searcher is not None:
+            try:
+                web_context = self._web_searcher.search_as_context(
+                    query, max_results=3
+                )
+                if web_context:
+                    return StreamingResponse(
+                        source_documents=[],
+                        mode="web_search",
+                        web_results_used=True,
+                        token_stream=self._stream_web_search(query, web_context),
+                    )
+            except Exception as exc:
+                logger.warning("Web search fallback failed: %s", exc)
 
-    # ------------------------------------------------------------------
-    # Private streaming generators
-    # ------------------------------------------------------------------
+        return StreamingResponse(
+            source_documents=[],
+            mode="base",
+            web_results_used=False,
+            token_stream=self._stream_base(query),
+        )
 
     async def _stream_rag(
         self,
         query: str,
         results: list[SearchResult],
     ) -> AsyncGenerator[str, None]:
-        """Stream tokens using retrieved context via LCEL.
-
-        Args:
-            query: The user's question.
-            results: Retrieved ``SearchResult`` objects.
-
-        Yields:
-            Individual string tokens as they arrive from the LLM.
-        """
+        """Stream tokens using retrieved KB context via LCEL."""
         context = self._format_context(results)
         chain = self._rag_prompt | self._llm
 
         try:
-            async for token in chain.astream(
-                {"context": context, "input": query}
-            ):
-                yield token
+            async for token in chain.astream({"context": context, "input": query}):
+                yield self._chunk_to_text(token)
         except Exception as exc:
-            yield (
-                f"\n\n⚠️ An error occurred while generating the response: "
-                f"{exc}"
-            )
+            yield f"\n\nAn error occurred while generating the response: {exc}"
 
-    async def _stream_base(
+    async def _stream_web_search(
         self,
         query: str,
+        web_context: str,
     ) -> AsyncGenerator[str, None]:
-        """Stream tokens from the base model (no context) via LCEL.
+        """Stream an answer from web search context via LCEL."""
+        chain = self._web_search_prompt | self._llm
+        try:
+            async for token in chain.astream(
+                {"context": web_context, "input": query}
+            ):
+                yield self._chunk_to_text(token)
+        except Exception as exc:
+            yield f"\n\nError generating response from web results: {exc}"
 
-        Args:
-            query: The user's question.
-
-        Yields:
-            Individual string tokens as they arrive from the LLM.
-        """
+    async def _stream_base(self, query: str) -> AsyncGenerator[str, None]:
+        """Stream tokens from the base model with no retrieved context."""
         chain = self._base_prompt | self._llm
 
         try:
             async for token in chain.astream({"input": query}):
-                yield token
+                yield self._chunk_to_text(token)
         except Exception as exc:
-            yield (
-                f"\n\n⚠️ An error occurred while generating the response: "
-                f"{exc}"
-            )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+            yield f"\n\nAn error occurred while generating the response: {exc}"
 
     @staticmethod
     def _format_context(results: list[SearchResult]) -> str:
-        """Format retrieved results into a numbered context block.
-
-        Args:
-            results: The search results to format.
-
-        Returns:
-            A string where each source is labelled ``[Source N]`` with
-            its title, origin, and content.
-        """
+        """Format retrieved KB results into a numbered context block."""
         parts: list[str] = []
         for idx, result in enumerate(results, 1):
             header = f"[Source {idx}]: {result.title or result.source}"
             origin = f"  Origin: {result.source} ({result.source_type})"
             parts.append(f"{header}\n{origin}\n{result.content}")
         return "\n\n---\n\n".join(parts)
+
+    @staticmethod
+    def _chunk_to_text(chunk: object) -> str:
+        """Normalize provider-specific stream chunks to plain text."""
+        content = getattr(chunk, "content", chunk)
+        if content is None:
+            return ""
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content") or ""
+                    parts.append(str(text))
+                else:
+                    text = (
+                        getattr(part, "text", None)
+                        or getattr(part, "content", None)
+                        or part
+                    )
+                    parts.append(str(text))
+            return "".join(parts)
+        return str(content)

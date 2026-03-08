@@ -60,7 +60,8 @@ class _OllamaEmbeddingAdapter:
     """Adapts ``langchain_ollama.OllamaEmbeddings`` to the chromadb
     ``EmbeddingFunction`` callable interface.
 
-    ChromaDB expects ``__call__(input: list[str]) -> list[list[float]]``.
+    ChromaDB expects ``__call__(input: list[str]) -> list[list[float]]``
+    and ``name() -> str`` (as a method, not a property).
     """
 
     def __init__(self, model: str, base_url: str) -> None:
@@ -71,6 +72,11 @@ class _OllamaEmbeddingAdapter:
             base_url: Ollama server URL (e.g. ``http://localhost:11434``).
         """
         self._model = OllamaEmbeddings(model=model, base_url=base_url)
+        self._name = f"ollama-{model}"
+
+    def name(self) -> str:
+        """Return the embedding function name (required by ChromaDB)."""
+        return self._name
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         """Embed a batch of texts.

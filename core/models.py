@@ -1,92 +1,24 @@
 """
-Ollama model management, health checking, and embedding configuration.
+Ollama model management and health checks.
 
-Provides functions to discover installed models, verify server health,
-and resolve the embedding model name.  All configuration values are
-read from ``st.secrets`` with graceful fallbacks.
+Runtime configuration is sourced exclusively from `config.settings`.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
 
 import streamlit as st
 
+from config.settings import settings
 
-# ---------------------------------------------------------------------------
-# Configuration helpers  (st.secrets → env → default)
-# ---------------------------------------------------------------------------
-
-def _get_secret(key: str, default: str) -> str:
-    """Read a value from ``st.secrets``, falling back to env vars.
-
-    Args:
-        key: Secret / environment variable name.
-        default: Value to return if neither source contains *key*.
-
-    Returns:
-        The resolved string value.
-    """
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets") and key in st.secrets:
-            return str(st.secrets[key])
-    except Exception:
-        pass
-    return os.environ.get(key, default)
-
-
-def _ollama_url() -> str:
-    """Resolve the Ollama base URL.
-
-    Returns:
-        Ollama server base URL (e.g. ``http://localhost:11434``).
-    """
-    return _get_secret("OLLAMA_BASE_URL", "http://localhost:11434")
-
-
-# ---------------------------------------------------------------------------
-# EMBEDDING_MODEL constant
-# ---------------------------------------------------------------------------
-
-def _resolve_embedding_model() -> str:
-    """Resolve the embedding model name with fallback logic.
-
-    Priority:
-        1. ``st.secrets["EMBEDDING_MODEL"]``
-        2. ``os.environ["EMBEDDING_MODEL"]``
-        3. ``"nomic-embed-text"`` (sensible default)
-
-    Returns:
-        Embedding model name string.
-    """
-    return _get_secret("EMBEDDING_MODEL", "nomic-embed-text")
-
-
-EMBEDDING_MODEL: str = _resolve_embedding_model()
-"""Module-level constant for the active embedding model name."""
-
-
-# ---------------------------------------------------------------------------
-# Health-check dataclass
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class OllamaHealth:
-    """Structured result from ``health_check()``.
-
-    Attributes:
-        is_running: Whether the Ollama server responded.
-        base_url: The URL that was probed.
-        models: List of installed model names (empty if offline).
-        error: Error message if the server is unreachable.
-    """
+    """Structured result from `health_check()`."""
 
     is_running: bool
     base_url: str
@@ -94,34 +26,16 @@ class OllamaHealth:
     error: str
 
 
-# ---------------------------------------------------------------------------
-# Public functions
-# ---------------------------------------------------------------------------
-
 @st.cache_data(ttl=30, show_spinner=False)
-def get_available_models(timeout: int = 3) -> list[str]:
-    """Poll Ollama ``/api/tags`` and return installed model names.
-
-    Cached for 30 seconds via ``st.cache_data`` to avoid
-    re-polling Ollama on every Streamlit rerun.
-
-    Excludes embedding-only models (names containing ``embed``).
-    Gracefully falls back to a single-element list containing the
-    default model if Ollama is unreachable.
-
-    Args:
-        timeout: HTTP request timeout in seconds.
-
-    Returns:
-        Sorted list of model name strings,
-        e.g. ``["deepseek-r1:latest", "gemma3:4b"]``.
-    """
-    default_model = _get_secret("DEFAULT_LLM_MODEL", "deepseek-r1:latest")
+def get_available_models(timeout: int | None = None) -> list[str]:
+    """Poll Ollama `/api/tags` and return installed non-embedding models."""
+    default_model = settings.default_model
+    request_timeout = timeout or settings.ollama_timeout
 
     try:
-        url = f"{_ollama_url()}/api/tags"
+        url = f"{settings.ollama_base_url}/api/tags"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             data: dict = json.loads(resp.read().decode("utf-8"))
 
         models: list[str] = []
@@ -132,29 +46,21 @@ def get_available_models(timeout: int = 3) -> list[str]:
 
         if models:
             return sorted(models)
-
     except Exception:
-        pass  # graceful fallback below
+        pass
 
     return [default_model]
 
 
-def health_check(timeout: int = 3) -> OllamaHealth:
-    """Check whether Ollama is running and list installed models.
-
-    Args:
-        timeout: HTTP request timeout in seconds.
-
-    Returns:
-        An ``OllamaHealth`` dataclass with server status, installed
-        models, and any error message.
-    """
-    base_url = _ollama_url()
+def health_check(timeout: int | None = None) -> OllamaHealth:
+    """Check whether Ollama is running and list installed models."""
+    base_url = settings.ollama_base_url
+    request_timeout = timeout or settings.ollama_timeout
 
     try:
         url = f"{base_url}/api/tags"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             data: dict = json.loads(resp.read().decode("utf-8"))
 
         all_models: list[str] = sorted(
@@ -169,7 +75,6 @@ def health_check(timeout: int = 3) -> OllamaHealth:
             models=all_models,
             error="",
         )
-
     except urllib.error.URLError as exc:
         return OllamaHealth(
             is_running=False,

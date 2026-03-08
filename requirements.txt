@@ -30,3 +30,12 @@ certifi>=2024.0.0
 
 # Tokenisation
 tiktoken>=0.7.0
+duckduckgo-search>=6.1.0
+
+# Cloud LLM providers (optional — install only what you use)
+langchain-openai>=0.2.0
+langchain-anthropic>=0.2.0
+langchain-groq>=0.2.0
+openai>=1.40.0
+anthropic>=0.34.0
+groq>=0.9.0

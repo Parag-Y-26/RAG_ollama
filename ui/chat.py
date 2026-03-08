@@ -1,13 +1,5 @@
 """
-Streaming chat interface with source citations.
-
-Renders conversation history, handles new messages with token-by-token
-streaming via ``st.write_stream()``, and shows collapsible source
-attribution below every assistant response.  Includes copy-to-clipboard
-and export-as-markdown controls.
-
-The async ``RAGChain.astream()`` is bridged to a sync generator so
-that Streamlit's synchronous ``st.write_stream()`` can consume it.
+Streaming chat interface with source citations and inline web search.
 """
 
 from __future__ import annotations
@@ -16,35 +8,30 @@ import asyncio
 import base64
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
 
 import streamlit as st
 
-from core.models import EMBEDDING_MODEL, _get_secret
+from config.settings import settings
 from core.rag_chain import RAGChain, StreamingResponse
 from core.vectorstore import KnowledgeBase, SearchResult
 from persistence.chat_store import ChatStore
 
 
-# ---------------------------------------------------------------------------
-# Session-state helpers
-# ---------------------------------------------------------------------------
-
 def _get_kb() -> KnowledgeBase:
-    """Return the active ``KnowledgeBase`` from session state."""
+    """Return the active knowledge base from session state."""
     if "kb" not in st.session_state:
         base = Path(__file__).resolve().parent.parent
         st.session_state.kb = KnowledgeBase(
             persist_dir=str(base / "data" / "chroma_db"),
             collection_name=st.session_state.get("notebook_id", "default"),
-            embedding_model=EMBEDDING_MODEL,
-            ollama_base_url=_get_secret("OLLAMA_BASE_URL", "http://localhost:11434"),
+            embedding_model=settings.embedding_model,
+            ollama_base_url=settings.ollama_base_url,
         )
     return st.session_state.kb
 
 
 def _get_chat_store() -> ChatStore:
-    """Return the ``ChatStore`` singleton from session state."""
+    """Return the chat store singleton from session state."""
     if "chat_store" not in st.session_state:
         base = Path(__file__).resolve().parent.parent
         st.session_state.chat_store = ChatStore(
@@ -53,8 +40,27 @@ def _get_chat_store() -> ChatStore:
     return st.session_state.chat_store
 
 
+@st.cache_resource
+def _get_rag_chain(
+    notebook_id: str,
+    model: str,
+    provider: str,
+    enable_web_search: bool,
+) -> RAGChain:
+    """Return a cached RAG chain per notebook, model, and web-search mode."""
+    del notebook_id
+
+    return RAGChain(
+        knowledge_base=_get_kb(),
+        model=model,
+        provider=provider,
+        enable_web_search=enable_web_search,
+        web_search_max_results=settings.web_search_max_results,
+    )
+
+
 def _init_messages() -> None:
-    """Load messages from persistent store into session state."""
+    """Load persisted messages into session state."""
     if "messages" not in st.session_state:
         store = _get_chat_store()
         notebook_id = st.session_state.get("notebook_id", "default")
@@ -70,133 +76,232 @@ def _init_messages() -> None:
         ]
 
 
-# ---------------------------------------------------------------------------
-# Async → Sync bridge
-# ---------------------------------------------------------------------------
-
-def _bridge_async_stream(
-    async_gen: Any,
-    loop: asyncio.AbstractEventLoop,
-) -> Generator[str, None, None]:
-    """Convert an async token generator to sync for ``st.write_stream()``.
-
-    Args:
-        async_gen: The ``AsyncGenerator[str, None]`` from ``RAGChain``.
-        loop: An event loop that stays alive for the streaming duration.
-
-    Yields:
-        Individual string tokens.
+def _sync_stream(async_gen) -> Generator[str, None, None]:
     """
-    while True:
-        try:
-            token: str = loop.run_until_complete(async_gen.__anext__())
-            yield token
-        except StopAsyncIteration:
-            break
+    Consume an async generator synchronously, token by token.
+    Uses a single event loop for the full stream duration.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        while True:
+            try:
+                yield loop.run_until_complete(async_gen.__anext__())
+            except StopAsyncIteration:
+                break
+    finally:
+        loop.close()
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _run_rag(
+    chain: RAGChain,
+    prompt: str,
+) -> tuple[StreamingResponse, Generator[str, None, None]]:
+    """
+    Run chain.astream() and return response metadata plus a sync token stream.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        resp: StreamingResponse = loop.run_until_complete(
+            chain.astream(prompt, top_k=5)
+        )
+    finally:
+        loop.close()
+    return resp, _sync_stream(resp.token_stream)
+
 
 def render_chat() -> None:
-    """Render the complete chat interface: history + input + controls."""
+    """Render the complete chat interface."""
     _init_messages()
 
     messages: list[dict] = st.session_state.messages
-
-    # ---- Chat controls (top row) ----------------------------------------
     _render_chat_controls()
 
-    # ---- Empty state ----------------------------------------------------
     if not messages:
         _render_empty_state()
 
-    # ---- History --------------------------------------------------------
     for idx, msg in enumerate(messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant":
                 _render_message_actions(msg, idx)
 
-    # ---- Input ----------------------------------------------------------
-    if prompt := st.chat_input("Ask your knowledge base a question…"):
+    if prompt := st.chat_input("Ask your knowledge base a question..."):
         _handle_user_input(prompt)
 
 
-# ---------------------------------------------------------------------------
-# User input handler
-# ---------------------------------------------------------------------------
-
 def _handle_user_input(prompt: str) -> None:
-    """Process a new user message: persist, stream, display."""
+    """Process a new user message, persist it, and stream the reply."""
     prompt = prompt.strip()
     if not prompt:
         return
 
+    lowered = prompt.lower()
+    if lowered == "/search" or lowered.startswith("/search "):
+        query = prompt[7:].strip()
+        if query:
+            _handle_inline_search(query)
+        else:
+            st.warning("Usage: /search <your query>")
+        return
+
     notebook_id = st.session_state.get("notebook_id", "default")
     store = _get_chat_store()
-    kb = _get_kb()
-    model = st.session_state.get("selected_model", "deepseek-r1:latest")
+    provider = st.session_state.get(
+        "selected_provider",
+        settings.llm_provider or "ollama",
+    )
+    model = st.session_state.get("selected_model", settings.default_model)
+    enable_web_search = st.session_state.get(
+        "enable_web_search",
+        settings.web_search_enabled_by_default,
+    )
 
-    # 1 — Save & display user message
     store.save_message(notebook_id, "user", prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt, "sources": [], "mode": ""})
+    st.session_state.messages.append(
+        {"role": "user", "content": prompt, "sources": [], "mode": ""}
+    )
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2 — Stream assistant response
     with st.chat_message("assistant"):
         if not st.session_state.get("ollama_running", False):
-            err = "⚠️ Ollama is not running. Start Ollama and refresh the page."
+            err = "Ollama is not running. Start Ollama and refresh the page."
             st.error(err)
-            st.session_state.messages.append({"role": "assistant", "content": err, "sources": [], "mode": "error"})
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": err,
+                    "sources": [],
+                    "mode": "error",
+                }
+            )
             return
 
         try:
-            chain = RAGChain(
-                knowledge_base=kb,
-                model=model,
-                ollama_base_url=_get_secret("OLLAMA_BASE_URL", "http://localhost:11434"),
+            chain = _get_rag_chain(
+                notebook_id,
+                model,
+                provider,
+                enable_web_search,
             )
+            resp, token_gen = _run_rag(chain, prompt)
+            answer: str = st.write_stream(token_gen)
 
-            # Bridge async → sync
-            loop = asyncio.new_event_loop()
-            try:
-                resp: StreamingResponse = loop.run_until_complete(
-                    chain.astream(prompt, top_k=5)
-                )
-
-                # Stream tokens — st.write_stream returns the full answer
-                answer: str = st.write_stream(
-                    _bridge_async_stream(resp.token_stream, loop)
-                )
-            finally:
-                loop.close()
-
-            # Sources & mode badge
-            source_names: list[str] = [s.source for s in resp.source_documents]
+            source_names: list[str] = [source.source for source in resp.source_documents]
             _render_source_cards(resp.source_documents, resp.mode)
 
-            # 3 — Persist assistant message
-            store.save_message(notebook_id, "assistant", answer, sources_cited=source_names)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": answer,
-                "sources": source_names,
-                "mode": resp.mode,
-            })
-
+            store.save_message(
+                notebook_id,
+                "assistant",
+                answer,
+                sources_cited=source_names,
+            )
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": source_names,
+                    "mode": resp.mode,
+                }
+            )
         except Exception as exc:
-            err = f"⚠️ Something went wrong: {exc}"
+            err = f"Something went wrong: {exc}"
             st.error(err)
             st.info("Make sure Ollama is running and your model is downloaded.")
-            st.session_state.messages.append({"role": "assistant", "content": err, "sources": [], "mode": "error"})
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": err,
+                    "sources": [],
+                    "mode": "error",
+                }
+            )
 
 
-# ---------------------------------------------------------------------------
-# Message actions: sources + copy
-# ---------------------------------------------------------------------------
+def _handle_inline_search(query: str) -> None:
+    """
+    Handle a /search <query> command typed in the chat.
+
+    Runs a DDG search and displays results inline in the chat thread.
+    """
+    from core.search import WebSearcher
+
+    notebook_id = st.session_state.get("notebook_id", "default")
+    store = _get_chat_store()
+
+    store.save_message(notebook_id, "user", f"/search {query}")
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": f"/search {query}",
+            "sources": [],
+            "mode": "",
+        }
+    )
+    with st.chat_message("user"):
+        st.markdown(f"`/search` {query}")
+
+    with st.chat_message("assistant"):
+        with st.spinner(f"Searching for '{query}'..."):
+            try:
+                searcher = WebSearcher(
+                    max_results=settings.web_search_max_results,
+                    max_fetch=0,
+                    region=settings.web_search_region,
+                )
+                results = searcher.search(query)
+
+                lines = [f"**Web search results for:** `{query}`", ""]
+                for i, result in enumerate(results, 1):
+                    lines.append(f"**{i}. [{result.title}]({result.url})**")
+                    lines.append(result.snippet)
+                    if result.published:
+                        lines.append(f"*{result.published}*")
+                    lines.append("")
+                answer = "\n".join(lines)
+
+                st.markdown(answer)
+                st.caption(
+                    f"↳ {len(results)} results from DuckDuckGo · not stored in KB"
+                )
+
+                if st.button(
+                    f"Absorb all {len(results)} results into KB",
+                    key=f"absorb_inline_{abs(hash(query))}",
+                ):
+                    kb = _get_kb()
+                    with st.spinner("Absorbing..."):
+                        try:
+                            docs = searcher.search_and_load(
+                                query,
+                                absorb_snippets_on_failure=True,
+                            )
+                            info = kb.add_source(docs)
+                            st.success(f"{info.chunk_count} chunks added to your KB.")
+                        except ValueError:
+                            st.info("These results are already in your KB.")
+                        except Exception as exc:
+                            st.error(f"Absorb failed: {exc}")
+
+                store.save_message(
+                    notebook_id,
+                    "assistant",
+                    answer,
+                    sources_cited=[],
+                )
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": [],
+                        "mode": "web_search",
+                    }
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Search failed: {exc}")
+
 
 def _render_message_actions(msg: dict, idx: int) -> None:
     """Render source attribution and copy button below an assistant message."""
@@ -204,101 +309,88 @@ def _render_message_actions(msg: dict, idx: int) -> None:
 
     with col_mode:
         if msg.get("mode") == "rag" and msg.get("sources"):
-            st.caption("💡 Answered from your knowledge base")
+            st.caption("↳ answered from knowledge base")
+        elif msg.get("mode") == "web_search":
+            st.caption("↳ answered from live web search")
         elif msg.get("mode") == "base":
-            st.caption("🌐 Answered from general knowledge — no matching sources")
-        elif msg.get("mode") == "error":
-            pass  # error messages don't need a badge
+            st.caption("↳ answered from model knowledge")
 
     with col_copy:
         _render_copy_button(msg["content"], f"copy_{idx}")
 
-    # Collapsible sources
     sources = msg.get("sources", [])
     if sources:
-        with st.expander(f"📎 Sources Used ({len(sources)})", expanded=False):
-            for i, s in enumerate(sources, 1):
-                # Determine icon
-                if "youtube" in s.lower() or "youtu.be" in s.lower():
-                    icon = "🎥"
-                elif s.lower().endswith(".pdf"):
-                    icon = "📄"
-                elif "perplexity" in s.lower():
-                    icon = "🔍"
-                elif s.startswith("http"):
-                    icon = "🌐"
+        with st.expander(f"Sources Used ({len(sources)})", expanded=False):
+            for i, source in enumerate(sources, 1):
+                if "youtube" in source.lower() or "youtu.be" in source.lower():
+                    icon = "Video"
+                elif source.lower().endswith(".pdf"):
+                    icon = "PDF"
+                elif "perplexity" in source.lower():
+                    icon = "Research"
+                elif source.startswith("http"):
+                    icon = "Web"
                 else:
-                    icon = "📝"
-                st.caption(f"{icon} [{i}] {s}")
+                    icon = "Text"
+                st.caption(f"{icon} [{i}] {source}")
 
 
 def _render_source_cards(results: list[SearchResult], mode: str) -> None:
-    """Render inline source cards immediately after streaming finishes."""
+    """Render inline source cards after streaming finishes."""
     if mode == "rag" and results:
-        st.caption("💡 Answered from your knowledge base")
-        with st.expander(f"📎 Sources Used ({len(results)})", expanded=False):
-            for i, r in enumerate(results, 1):
-                if "youtube" in r.source.lower():
-                    icon = "🎥"
-                elif r.source.lower().endswith(".pdf"):
-                    icon = "📄"
-                elif "perplexity" in r.source.lower():
-                    icon = "🔍"
-                elif r.source.startswith("http"):
-                    icon = "🌐"
+        st.caption("↳ answered from knowledge base")
+        with st.expander(f"Sources Used ({len(results)})", expanded=False):
+            for i, result in enumerate(results, 1):
+                if "youtube" in result.source.lower():
+                    label = "Video"
+                elif result.source.lower().endswith(".pdf"):
+                    label = "PDF"
+                elif "perplexity" in result.source.lower():
+                    label = "Research"
+                elif result.source.startswith("http"):
+                    label = "Web"
                 else:
-                    icon = "📝"
-                st.markdown(
-                    f"**{icon} Source {i}:** {r.title or r.source}",
-                )
-                st.caption(
-                    f"_{r.source_type}_ • Relevance: {r.score:.0%}"
-                )
-                st.caption(r.content[:200] + "…" if len(r.content) > 200 else r.content)
+                    label = "Text"
+
+                st.markdown(f"**{label} Source {i}:** {result.title or result.source}")
+                st.caption(f"{result.source_type} - Relevance: {result.score:.0%}")
+                preview = result.content[:200]
+                if len(result.content) > 200:
+                    preview += "..."
+                st.caption(preview)
                 if i < len(results):
                     st.markdown("---")
+    elif mode == "web_search":
+        st.caption("↳ answered from live web search  ·  not stored in KB")
     elif mode == "base":
-        st.caption("🌐 No matching sources found — answered from general knowledge")
+        st.caption("↳ answered from model knowledge  ·  no sources found")
 
-
-# ---------------------------------------------------------------------------
-# Copy to clipboard
-# ---------------------------------------------------------------------------
 
 def _render_copy_button(content: str, key: str) -> None:
-    """Inject a copy-to-clipboard button via HTML/JS.
+    """Inject a copy-to-clipboard button via HTML and inline JS."""
+    del key
 
-    Uses Base64 encoding to safely pass content through inline JS
-    without special-character escaping issues.
-
-    Args:
-        content: Text to copy.
-        key: Unique Streamlit element key.
-    """
     b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
     st.markdown(
         f"""<button onclick="
             navigator.clipboard.writeText(atob('{b64}'));
-            this.innerText='✅';
-            setTimeout(()=>this.innerText='📋',1500);
-        " style="background:none;border:1px solid #333;
-        border-radius:4px;color:#71717A;cursor:pointer;
+            this.innerText='OK';
+            setTimeout(()=>this.innerText='Copy',1500);
+        " style="font-family:'DM Mono','Fira Mono','Courier New',monospace;
+        background:#000000;border:1px solid #1C1C1C;
+        border-radius:2px;color:#555555;cursor:pointer;
         padding:2px 8px;font-size:0.72rem;"
-        title="Copy to clipboard">📋</button>""",
+        title="Copy to clipboard">Copy</button>""",
         unsafe_allow_html=True,
     )
 
 
-# ---------------------------------------------------------------------------
-# Chat controls: clear + export
-# ---------------------------------------------------------------------------
-
 def _render_chat_controls() -> None:
-    """Clear-chat and export buttons."""
+    """Render clear-chat and export buttons."""
     col_clear, col_export, _ = st.columns([1, 1, 4])
 
     with col_clear:
-        if st.button("🗑️ Clear", key="clear_chat_btn", help="Clear chat history"):
+        if st.button("Clear", key="clear_chat_btn", help="Clear chat history"):
             notebook_id = st.session_state.get("notebook_id", "default")
             _get_chat_store().clear_history(notebook_id)
             st.session_state.messages = []
@@ -308,7 +400,7 @@ def _render_chat_controls() -> None:
         notebook_id = st.session_state.get("notebook_id", "default")
         md_content = _get_chat_store().export_as_markdown(notebook_id)
         st.download_button(
-            "📥 Export",
+            "Export",
             data=md_content,
             file_name=f"chat_{notebook_id}.md",
             mime="text/markdown",
@@ -317,21 +409,16 @@ def _render_chat_controls() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Empty state
-# ---------------------------------------------------------------------------
-
 def _render_empty_state() -> None:
     """Render a welcome screen when no messages exist."""
     st.markdown(
-        """<div style="text-align:center;padding:3rem 2rem;animation:fadeIn 0.5s ease;">
-            <div style="font-size:3rem;margin-bottom:1rem;">🧠</div>
-            <div style="font-size:1.1rem;font-weight:600;color:#71717A;margin-bottom:0.5rem;">
-                Your AI Knowledge Base
-            </div>
-            <div style="font-size:0.85rem;color:#52525B;">
-                Add sources from the sidebar — PDFs, websites, YouTube videos,
-                or run web research — then ask questions about your content.
+        """<div class="empty-state">
+            <span class="emoji">◈</span>
+            <div class="title">Knowledge Base Empty</div>
+            <div class="subtitle">
+                Add sources from the sidebar.<br>
+                PDFs · web pages · YouTube · research.<br><br>
+                Or type <code>/search &lt;query&gt;</code> to search the web.
             </div>
         </div>""",
         unsafe_allow_html=True,
